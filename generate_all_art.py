@@ -49,12 +49,12 @@ except ImportError:
 COMFYUI_URL = "127.0.0.1:8188"  # Default ComfyUI address
 CLIENT_ID = str(uuid.uuid4())
 
-# Your SDXL checkpoint filename (as it appears in ComfyUI)
-# Change this to match your installed model
-CHECKPOINT = "juggernautXL_v9Rundiffusionphoto2.safetensors"
-# Alternatives:
-# CHECKPOINT = "realvisxlV40_v40Bakedvae.safetensors"
-# CHECKPOINT = "sd_xl_base_1.0.safetensors"
+# Auto-detect checkpoint: scans your ComfyUI models folder
+# If auto-detect fails, manually set the filename here:
+CHECKPOINT = None  # Set to None for auto-detect, or "YourModel.safetensors"
+
+# Your ComfyUI path (used for auto-detect only)
+COMFYUI_MODELS_PATH = r"C:\Users\Mati\Downloads\AI\ComfyUI\ComfyUI\models\checkpoints"
 
 # Generation settings optimized for 3080 Ti 12GB
 DEFAULT_WIDTH = 1344
@@ -214,6 +214,10 @@ def generate_and_save(positive, negative, width, height, save_dir, filename_base
 
     full_negative = f"{negative}, {GLOBAL_NEGATIVE}" if negative else GLOBAL_NEGATIVE
 
+    # Log progress to file
+    log_file = OUTPUT_DIR / "generation_log.txt"
+    log_file.parent.mkdir(parents=True, exist_ok=True)
+
     for i in range(num_variations):
         seed = seed_start + i if seed_start > 0 else -1
         workflow = build_workflow(positive, full_negative, width, height, seed=seed, steps=steps, cfg=cfg)
@@ -230,9 +234,13 @@ def generate_and_save(positive, negative, width, height, save_dir, filename_base
                 filepath = save_dir / filename
                 img.save(filepath, "PNG")
                 print(f"  ✓ Saved: {filepath}")
+                with open(log_file, "a") as lf:
+                    lf.write(f"{time.strftime('%H:%M:%S')} ✓ {filepath}\n")
 
         except Exception as e:
             print(f"  ✗ FAILED: {filename_base}_v{i+1} - {e}")
+            with open(log_file, "a") as lf:
+                lf.write(f"{time.strftime('%H:%M:%S')} ✗ FAILED {filename_base}_v{i+1}: {e}\n")
             continue
 
         # Small delay between generations to prevent VRAM issues
@@ -792,10 +800,47 @@ def test_connection():
 
 
 def main():
+    global CHECKPOINT
+
     print("="*60)
     print("  WILDFOLD - Art Asset Generator")
     print("  Generates ALL game art via ComfyUI")
     print("="*60)
+
+    # Auto-detect checkpoint if not set
+    if CHECKPOINT is None:
+        models_dir = Path(COMFYUI_MODELS_PATH)
+        if models_dir.exists():
+            safetensors = list(models_dir.glob("*.safetensors"))
+            # Filter out tiny files (VAE, text encoders) - real checkpoints are >2GB
+            checkpoints = [f for f in safetensors if f.stat().st_size > 2_000_000_000]
+            if checkpoints:
+                # Prefer known good SDXL models
+                preferred = ["realvis", "juggernaut", "dreamshar", "sdxl", "xl"]
+                best = None
+                for pref in preferred:
+                    for cp in checkpoints:
+                        if pref in cp.name.lower():
+                            best = cp
+                            break
+                    if best:
+                        break
+                if not best:
+                    best = checkpoints[0]
+                CHECKPOINT = best.name
+                print(f"\n  Auto-detected model: {CHECKPOINT}")
+                print(f"  Size: {best.stat().st_size / 1024**3:.1f} GB")
+            else:
+                print("\n  ERROR: No checkpoint models found (>2GB) in:")
+                print(f"    {COMFYUI_MODELS_PATH}")
+                print("\n  Run RUN_ART_GENERATOR.bat to download one automatically,")
+                print("  or manually download an SDXL model and place it there.")
+                sys.exit(1)
+        else:
+            print(f"\n  ERROR: Models directory not found: {COMFYUI_MODELS_PATH}")
+            print("  Edit COMFYUI_MODELS_PATH in this script.")
+            sys.exit(1)
+
     print(f"\nCheckpoint: {CHECKPOINT}")
     print(f"Output: {OUTPUT_DIR.absolute()}")
 
@@ -831,15 +876,30 @@ def main():
         print("\n\n⚠ Generation interrupted by user. Partial results saved.")
     except Exception as e:
         print(f"\n\n✗ Error: {e}")
+        import traceback
+        traceback.print_exc()
         print("  Partial results saved. Re-run to continue.")
 
     elapsed = time.time() - start_time
     hours = int(elapsed // 3600)
     mins = int((elapsed % 3600) // 60)
-    print(f"\n{'='*60}")
-    print(f"  COMPLETE! Time: {hours}h {mins}m")
-    print(f"  Output: {OUTPUT_DIR.absolute()}")
-    print(f"{'='*60}")
+
+    # Count generated files
+    total_files = sum(1 for _ in OUTPUT_DIR.rglob("*.png")) if OUTPUT_DIR.exists() else 0
+
+    summary = f"""
+{'='*60}
+  COMPLETE!
+  Time: {hours}h {mins}m
+  Images generated: {total_files}
+  Output: {OUTPUT_DIR.absolute()}
+{'='*60}
+"""
+    print(summary)
+
+    # Save summary to file
+    with open(OUTPUT_DIR / "generation_log.txt", "a") as f:
+        f.write(f"\n{time.strftime('%Y-%m-%d %H:%M:%S')}\n{summary}")
 
 
 if __name__ == "__main__":
