@@ -1,22 +1,17 @@
 #!/usr/bin/env python3
 """
-WILDFOLD - Premium Art Pipeline
-=================================
-Generates production-quality game art via ComfyUI.
-- Best-of-4 selection (sharpness scoring)
-- 2-pass hi-res generation for backgrounds
-- Per-world color grading for visual consistency
-- Smart edge-aware background removal for sprites
-- Auto upscale for crisp detail
+WILDFOLD - Premium Art Pipeline v2 (Parallax-Correct)
+======================================================
+Properly generates parallax-compatible game art:
+- FAR layers: side-view horizon sky, tileable, fully opaque
+- MID layers: side-view main scene, the hero background, fully opaque
+- FOREGROUND: individual transparent objects placed in-engine (NOT full scenes)
+- SPRITES: characters, enemies, objects with auto bg-removal
 
 SETUP:
   1. Start ComfyUI: cd ComfyUI && python main.py
-  2. Download SDXL model into ComfyUI/models/checkpoints/
-  3. python generate_all_art.py
-  4. Sleep. ~3-4 hours on RTX 3080 Ti.
-
-REQUIREMENTS (auto-installed):
-  pip install websocket-client Pillow numpy scipy
+  2. python generate_all_art.py
+  3. Sleep. ~3-4 hours on RTX 3080 Ti.
 """
 
 import json, os, sys, time, uuid, urllib.request, urllib.parse
@@ -30,7 +25,7 @@ for pkg in ["websocket-client", "Pillow", "numpy", "scipy"]:
         os.system(f"{sys.executable} -m pip install {pkg}")
 
 import websocket
-from PIL import Image, ImageFilter, ImageEnhance, ImageStat
+from PIL import Image, ImageFilter, ImageEnhance
 import numpy as np
 from scipy import ndimage
 
@@ -40,36 +35,31 @@ from scipy import ndimage
 
 COMFYUI_URL = "127.0.0.1:8188"
 CLIENT_ID = str(uuid.uuid4())
-
-CHECKPOINT = None  # Auto-detect
-COMFYUI_MODELS_PATH = r"C:\Users\Mati\Downloads\AI\ComfyUI\ComfyUI\models\checkpoints"
-
+CHECKPOINT = None
+COMFYUI_MODELS_PATH = r"C:\Users\Mati\Downloads\AI\ComfyUI\models\checkpoints"
 ASSETS_DIR = Path("./assets")
 
-# Generation settings for 3080 Ti 12GB
 BG_WIDTH = 1344
 BG_HEIGHT = 768
-BG_UPSCALE_WIDTH = 1920   # Final bg resolution
-BG_UPSCALE_HEIGHT = 1080
-SPRITE_GEN_SIZE = 1024
-SPRITE_FINAL_SIZE = 512    # Characters
-ENEMY_FINAL_SIZE = 512     # Enemies
-OBJECT_FINAL_SIZE = 384    # Objects
+BG_FINAL_W = 1920
+BG_FINAL_H = 1080
+SPRITE_GEN = 1024
+SPRITE_FINAL = 512
+ENEMY_FINAL = 512
+OBJ_FINAL = 384
 
-STEPS = 35           # More steps = more detail
+STEPS = 35
 CFG = 7.5
 SPRITE_CFG = 6.0
 SAMPLER = "dpmpp_2m"
 SCHEDULER = "karras"
+CANDIDATES = 4
 
-CANDIDATES = 4  # Generate N, keep best
+BG_NAVY = (10, 10, 40)
+BG_BLACK = (0, 0, 0)
+BG_TOL = 45
 
-# Background removal
-BG_COLOR_NAVY = (10, 10, 40)
-BG_COLOR_BLACK = (0, 0, 0)
-BG_TOLERANCE = 45
-
-GLOBAL_NEGATIVE = (
+GNEG = (
     "text, watermark, signature, logo, username, blurry, out of focus, "
     "low quality, low resolution, jpeg artifacts, deformed, disfigured, "
     "mutated, ugly, duplicate, error, cropped, worst quality, "
@@ -78,80 +68,26 @@ GLOBAL_NEGATIVE = (
 
 # ============================================================================
 # PER-WORLD COLOR GRADING
-# Ensures visual consistency within each world
 # ============================================================================
 
-WORLD_GRADING = {
-    "garden": {
-        "brightness": 0.95,     # Slightly dark (night)
-        "contrast": 1.1,
-        "saturation": 1.05,
-        "color_temp": (-5, -3, 10),  # Cool blue night shift
-        "tint": (20, 25, 50),         # Night blue tint overlay at 8% opacity
-        "tint_opacity": 0.08,
-    },
-    "neighborhood": {
-        "brightness": 1.0,
-        "contrast": 1.05,
-        "saturation": 0.95,      # Slightly muted
-        "color_temp": (10, 5, -5),  # Warm dusk
-        "tint": (50, 35, 20),
-        "tint_opacity": 0.06,
-    },
-    "park": {
-        "brightness": 0.98,
-        "contrast": 1.0,
-        "saturation": 0.9,       # Overcast = desaturated
-        "color_temp": (-3, -2, -2),
-        "tint": (40, 42, 45),    # Grey overcast
-        "tint_opacity": 0.05,
-    },
-    "stream": {
-        "brightness": 1.05,
-        "contrast": 1.1,
-        "saturation": 1.15,      # Rich greens
-        "color_temp": (-5, 8, -3),  # Green shift
-        "tint": (15, 35, 20),
-        "tint_opacity": 0.05,
-    },
-    "forest": {
-        "brightness": 0.85,      # Dark
-        "contrast": 1.15,
-        "saturation": 0.9,
-        "color_temp": (-8, -2, 5),  # Dark cool
-        "tint": (10, 18, 15),
-        "tint_opacity": 0.1,
-    },
-    "mountain": {
-        "brightness": 1.1,
-        "contrast": 1.2,         # Harsh dramatic
-        "saturation": 0.95,
-        "color_temp": (-3, -3, 5),  # Cool altitude
-        "tint": (35, 38, 50),
-        "tint_opacity": 0.04,
-    },
-    "sky": {
-        "brightness": 1.0,
-        "contrast": 1.15,
-        "saturation": 1.1,
-        "color_temp": (-5, -5, 15),  # Deep blue space
-        "tint": (5, 8, 30),
-        "tint_opacity": 0.08,
-    },
+GRADE = {
+    "garden":       {"brightness": 0.95, "contrast": 1.1,  "saturation": 1.05, "temp": (-5,-3,10),  "tint": (20,25,50),  "tint_a": 0.08},
+    "neighborhood": {"brightness": 1.0,  "contrast": 1.05, "saturation": 0.95, "temp": (10,5,-5),   "tint": (50,35,20),  "tint_a": 0.06},
+    "park":         {"brightness": 0.98, "contrast": 1.0,  "saturation": 0.9,  "temp": (-3,-2,-2),  "tint": (40,42,45),  "tint_a": 0.05},
+    "stream":       {"brightness": 1.05, "contrast": 1.1,  "saturation": 1.15, "temp": (-5,8,-3),   "tint": (15,35,20),  "tint_a": 0.05},
+    "forest":       {"brightness": 0.85, "contrast": 1.15, "saturation": 0.9,  "temp": (-8,-2,5),   "tint": (10,18,15),  "tint_a": 0.1},
+    "mountain":     {"brightness": 1.1,  "contrast": 1.2,  "saturation": 0.95, "temp": (-3,-3,5),   "tint": (35,38,50),  "tint_a": 0.04},
+    "sky":          {"brightness": 1.0,  "contrast": 1.15, "saturation": 1.1,  "temp": (-5,-5,15),  "tint": (5,8,30),    "tint_a": 0.08},
 }
 
-# ============================================================================
-# ART DIRECTION PREFIXES (prepended to all prompts per world)
-# ============================================================================
-
-WORLD_STYLE = {
-    "garden":       "masterpiece, award-winning photography, magical atmosphere, cinematic lighting, volumetric firefly light, dark moody night scene with warm pockets of light, ",
-    "neighborhood": "masterpiece, cinematic photography, golden hour dusk lighting, warm streetlamp glow, nostalgic suburban autumn atmosphere, ",
-    "park":         "masterpiece, cinematic photography, overcast diffused natural light, moody grey sky, lush green nature, peaceful yet melancholic, ",
-    "stream":       "masterpiece, nature photography, dappled sunlight through canopy, crystal clear water, lush green forest, vibrant natural colors, ",
-    "forest":       "masterpiece, dark atmospheric photography, deep shadows, volumetric fog, mysterious ancient woodland, sparse dramatic light shafts, ",
-    "mountain":     "masterpiece, epic landscape photography, dramatic clouds, vast scale, harsh alpine light, wind-swept desolation, ",
-    "sky":          "masterpiece, aerospace photography, ethereal atmosphere, cosmic lighting, vast infinite space, transcendent beauty, ",
+STYLE = {
+    "garden":       "masterpiece, award-winning photography, magical atmosphere, cinematic lighting, volumetric firefly light, dark moody night, ",
+    "neighborhood": "masterpiece, cinematic photography, golden hour dusk, warm streetlamp glow, nostalgic autumn, ",
+    "park":         "masterpiece, cinematic photography, overcast diffused light, moody grey sky, lush green, ",
+    "stream":       "masterpiece, nature photography, dappled sunlight, crystal water, lush green forest, vibrant, ",
+    "forest":       "masterpiece, dark atmospheric photography, deep shadows, volumetric fog, mysterious ancient woodland, ",
+    "mountain":     "masterpiece, epic landscape photography, dramatic clouds, vast scale, harsh alpine light, ",
+    "sky":          "masterpiece, aerospace photography, ethereal, cosmic lighting, vast infinite space, transcendent, ",
     "sprite":       "masterpiece, product photography, studio lighting, crisp sharp focus, clean edges, professional, ",
 }
 
@@ -159,669 +95,467 @@ WORLD_STYLE = {
 # COMFYUI API
 # ============================================================================
 
-def queue_prompt(workflow):
-    data = json.dumps({"prompt": workflow, "client_id": CLIENT_ID}).encode()
-    req = urllib.request.Request(f"http://{COMFYUI_URL}/prompt", data=data,
-                                 headers={"Content-Type": "application/json"})
+def queue_prompt(wf):
+    data = json.dumps({"prompt": wf, "client_id": CLIENT_ID}).encode()
+    req = urllib.request.Request(f"http://{COMFYUI_URL}/prompt", data=data, headers={"Content-Type": "application/json"})
     return json.loads(urllib.request.urlopen(req).read())["prompt_id"]
 
-def wait_and_get_images(prompt_id):
+def wait_images(pid):
     ws = websocket.WebSocket()
     ws.connect(f"ws://{COMFYUI_URL}/ws?clientId={CLIENT_ID}")
     while True:
         out = ws.recv()
         if isinstance(out, str):
             msg = json.loads(out)
-            if msg["type"] == "executing" and msg["data"]["node"] is None and msg["data"]["prompt_id"] == prompt_id:
+            if msg["type"] == "executing" and msg["data"]["node"] is None and msg["data"]["prompt_id"] == pid:
                 break
     ws.close()
-    resp = urllib.request.urlopen(f"http://{COMFYUI_URL}/history/{prompt_id}")
-    history = json.loads(resp.read())[prompt_id]
-    images = []
-    for node_output in history["outputs"].values():
-        if "images" in node_output:
-            for img in node_output["images"]:
-                url = f"http://{COMFYUI_URL}/view?filename={urllib.parse.quote(img['filename'])}&subfolder={urllib.parse.quote(img.get('subfolder', ''))}&type={img['type']}"
-                images.append(urllib.request.urlopen(url).read())
-    return images
+    resp = urllib.request.urlopen(f"http://{COMFYUI_URL}/history/{pid}")
+    hist = json.loads(resp.read())[pid]
+    imgs = []
+    for no in hist["outputs"].values():
+        if "images" in no:
+            for im in no["images"]:
+                url = f"http://{COMFYUI_URL}/view?filename={urllib.parse.quote(im['filename'])}&subfolder={urllib.parse.quote(im.get('subfolder',''))}&type={im['type']}"
+                imgs.append(urllib.request.urlopen(url).read())
+    return imgs
 
-def build_workflow(positive, negative, width, height, seed=-1, steps=STEPS, cfg=CFG):
-    if seed == -1:
-        seed = int.from_bytes(os.urandom(4), "big")
+def build_wf(pos, neg, w, h, seed=-1, steps=STEPS, cfg=CFG):
+    if seed == -1: seed = int.from_bytes(os.urandom(4), "big")
     return {
         "3": {"inputs": {"seed": seed, "steps": steps, "cfg": cfg, "sampler_name": SAMPLER,
-              "scheduler": SCHEDULER, "denoise": 1.0, "model": ["4", 0],
-              "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0]}, "class_type": "KSampler"},
+              "scheduler": SCHEDULER, "denoise": 1.0, "model": ["4",0], "positive": ["6",0],
+              "negative": ["7",0], "latent_image": ["5",0]}, "class_type": "KSampler"},
         "4": {"inputs": {"ckpt_name": CHECKPOINT}, "class_type": "CheckpointLoaderSimple"},
-        "5": {"inputs": {"width": width, "height": height, "batch_size": 1}, "class_type": "EmptyLatentImage"},
-        "6": {"inputs": {"text": positive, "clip": ["4", 1]}, "class_type": "CLIPTextEncode"},
-        "7": {"inputs": {"text": negative, "clip": ["4", 1]}, "class_type": "CLIPTextEncode"},
-        "8": {"inputs": {"samples": ["3", 0], "vae": ["4", 2]}, "class_type": "VAEDecode"},
-        "9": {"inputs": {"filename_prefix": "wildfold", "images": ["8", 0]}, "class_type": "SaveImage"},
+        "5": {"inputs": {"width": w, "height": h, "batch_size": 1}, "class_type": "EmptyLatentImage"},
+        "6": {"inputs": {"text": pos, "clip": ["4",1]}, "class_type": "CLIPTextEncode"},
+        "7": {"inputs": {"text": neg, "clip": ["4",1]}, "class_type": "CLIPTextEncode"},
+        "8": {"inputs": {"samples": ["3",0], "vae": ["4",2]}, "class_type": "VAEDecode"},
+        "9": {"inputs": {"filename_prefix": "wf", "images": ["8",0]}, "class_type": "SaveImage"},
     }
 
 # ============================================================================
-# IMAGE QUALITY SCORING
+# IMAGE PROCESSING
 # ============================================================================
 
-def sharpness_score(img):
-    """Score image sharpness using Laplacian variance. Higher = sharper."""
-    grey = np.array(img.convert("L"), dtype=np.float64)
-    laplacian = ndimage.laplace(grey)
-    return float(np.var(laplacian))
+def quality_score(img):
+    g = np.array(img.convert("L"), dtype=np.float64)
+    lap = float(np.var(ndimage.laplace(g)))
+    sx = ndimage.sobel(g, axis=0); sy = ndimage.sobel(g, axis=1)
+    edge = float(np.mean(np.hypot(sx, sy)))
+    return lap * 0.5 + edge * 0.3 + float(np.std(g)) * 0.2
 
-def detail_score(img):
-    """Combined quality score: sharpness + edge density + contrast."""
-    grey = np.array(img.convert("L"), dtype=np.float64)
-    # Sharpness
-    lap_var = float(np.var(ndimage.laplace(grey)))
-    # Edge density (Sobel)
-    sx = ndimage.sobel(grey, axis=0)
-    sy = ndimage.sobel(grey, axis=1)
-    edge_density = float(np.mean(np.hypot(sx, sy)))
-    # Local contrast
-    local_std = float(np.std(grey))
-    # Weighted combination
-    return lap_var * 0.5 + edge_density * 0.3 + local_std * 0.2
+def pick_best(imgs):
+    if len(imgs) <= 1: return imgs[0] if imgs else None
+    return max(imgs, key=quality_score)
 
-def pick_best(images):
-    """From a list of PIL Images, return the one with highest quality score."""
-    if len(images) == 1:
-        return images[0]
-    scored = [(detail_score(img), img) for img in images]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[0][1]
-
-# ============================================================================
-# IMAGE POST-PROCESSING
-# ============================================================================
-
-def remove_background_smart(img, bg_color=BG_COLOR_NAVY, tolerance=BG_TOLERANCE):
-    """Edge-aware background removal with alpha matting."""
+def remove_bg(img, bg_col=BG_NAVY, tol=BG_TOL):
     img = img.convert("RGBA")
-    data = np.array(img, dtype=np.float64)
-    r, g, b = data[:,:,0], data[:,:,1], data[:,:,2]
-
-    # Color distance
-    dist = np.sqrt((r - bg_color[0])**2 + (g - bg_color[1])**2 + (b - bg_color[2])**2)
-
-    # Hard mask
-    hard_mask = dist > tolerance
-
-    # Soft edge mask (gradient at edges for anti-aliasing)
-    soft_zone = tolerance * 0.6
-    alpha = np.clip((dist - (tolerance - soft_zone)) / soft_zone, 0, 1)
-    alpha = (alpha * 255).astype(np.uint8)
-
-    # Edge detection to preserve sharp edges of the subject
+    d = np.array(img, dtype=np.float64)
+    dist = np.sqrt((d[:,:,0]-bg_col[0])**2 + (d[:,:,1]-bg_col[1])**2 + (d[:,:,2]-bg_col[2])**2)
+    soft = tol * 0.6
+    alpha = np.clip((dist - (tol - soft)) / soft, 0, 1) * 255
+    # Edge preservation
     grey = np.array(img.convert("L"), dtype=np.float64)
     edges = ndimage.sobel(grey)
     edge_mask = edges > np.percentile(edges, 85)
-
-    # Where there are strong edges, use hard alpha
-    alpha[edge_mask & hard_mask] = 255
-
-    # Apply
+    hard = dist > tol
+    alpha[edge_mask & hard] = 255
     result = np.array(img)
-    result[:,:,3] = alpha
-
-    # Clean up: remove isolated transparent pixels inside the subject
-    from scipy.ndimage import binary_fill_holes, binary_dilation
-    subject_mask = alpha > 128
-    filled = binary_fill_holes(subject_mask)
-    # Restore alpha for filled holes
-    result[filled & ~subject_mask, 3] = 255
-
+    result[:,:,3] = alpha.astype(np.uint8)
+    # Fill holes
+    subject = alpha > 128
+    from scipy.ndimage import binary_fill_holes
+    filled = binary_fill_holes(subject)
+    result[filled & ~subject, 3] = 255
     return Image.fromarray(result)
 
-def trim_transparent(img):
-    """Crop transparent borders with small padding."""
-    if img.mode != "RGBA":
-        return img
-    bbox = img.getbbox()
-    if bbox:
-        # Add 4px padding
-        x1 = max(0, bbox[0] - 4)
-        y1 = max(0, bbox[1] - 4)
-        x2 = min(img.width, bbox[2] + 4)
-        y2 = min(img.height, bbox[3] + 4)
-        return img.crop((x1, y1, x2, y2))
-    return img
-
-def upscale_lanczos(img, target_w, target_h):
-    """High-quality upscale using Lanczos resampling."""
-    return img.resize((target_w, target_h), Image.LANCZOS)
-
-def sharpen_pass(img, amount=1.3):
-    """Subtle sharpening for crisp detail."""
-    enhancer = ImageEnhance.Sharpness(img)
-    return enhancer.enhance(amount)
+def trim(img, pad=4):
+    if img.mode != "RGBA": return img
+    bb = img.getbbox()
+    if not bb: return img
+    return img.crop((max(0,bb[0]-pad), max(0,bb[1]-pad), min(img.width,bb[2]+pad), min(img.height,bb[3]+pad)))
 
 def color_grade(img, world):
-    """Apply per-world color grading for visual consistency."""
-    if world not in WORLD_GRADING:
-        return img
-
-    g = WORLD_GRADING[world]
-
-    # Brightness
+    if world not in GRADE: return img
+    g = GRADE[world]
     img = ImageEnhance.Brightness(img).enhance(g["brightness"])
-    # Contrast
     img = ImageEnhance.Contrast(img).enhance(g["contrast"])
-    # Saturation
     img = ImageEnhance.Color(img).enhance(g["saturation"])
+    d = np.array(img).astype(np.float64)
+    ch = min(3, d.shape[2]) if len(d.shape) == 3 else 0
+    if ch:
+        for c in range(ch): d[:,:,c] = np.clip(d[:,:,c] + g["temp"][c], 0, 255)
+        if g["tint_a"] > 0:
+            t = np.array(g["tint"], dtype=np.float64)
+            o = g["tint_a"]
+            for c in range(ch): d[:,:,c] = d[:,:,c] * (1-o) + t[c] * o * 255 / max(max(t), 1)
+    return Image.fromarray(np.clip(d, 0, 255).astype(np.uint8))
 
-    # Color temperature shift
-    data = np.array(img).astype(np.float64)
-    ct = g["color_temp"]
-    if len(data.shape) == 3:
-        channels = min(3, data.shape[2])
-        for c in range(channels):
-            data[:,:,c] = np.clip(data[:,:,c] + ct[c], 0, 255)
-
-    # Tint overlay
-    if g["tint_opacity"] > 0:
-        tint = np.array(g["tint"], dtype=np.float64)
-        opacity = g["tint_opacity"]
-        for c in range(channels):
-            data[:,:,c] = data[:,:,c] * (1 - opacity) + tint[c] * opacity * 255 / max(tint)
-
-    data = np.clip(data, 0, 255).astype(np.uint8)
-    return Image.fromarray(data)
+def sharpen(img, amt=1.3):
+    return ImageEnhance.Sharpness(img).enhance(amt)
 
 # ============================================================================
-# LOGGING
+# GENERATION FUNCTIONS
 # ============================================================================
 
-LOG_FILE = None
-STATS = {"ok": 0, "fail": 0, "total_candidates": 0}
+LOG = None
+STATS = {"ok": 0, "fail": 0, "gens": 0}
 
-def log(msg):
-    print(msg)
-    if LOG_FILE:
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{time.strftime('%H:%M:%S')} {msg}\n")
+def log(m):
+    print(m)
+    if LOG:
+        with open(LOG, "a") as f: f.write(f"{time.strftime('%H:%M:%S')} {m}\n")
 
-# ============================================================================
-# CORE GENERATION
-# ============================================================================
-
-def generate_candidates(positive, negative, width, height, n=CANDIDATES, cfg_val=CFG):
-    """Generate N candidate images, return as list of PIL Images."""
-    neg = f"{negative}, {GLOBAL_NEGATIVE}" if negative else GLOBAL_NEGATIVE
-    candidates = []
+def gen_candidates(pos, neg, w, h, n=CANDIDATES, cfg=CFG):
+    neg_full = f"{neg}, {GNEG}" if neg else GNEG
+    cands = []
     for i in range(n):
         try:
-            wf = build_workflow(positive, neg, width, height, cfg=cfg_val, steps=STEPS)
-            pid = queue_prompt(wf)
-            imgs = wait_and_get_images(pid)
-            if imgs:
-                candidates.append(Image.open(BytesIO(imgs[0])))
+            pid = queue_prompt(build_wf(pos, neg_full, w, h, cfg=cfg))
+            imgs = wait_images(pid)
+            if imgs: cands.append(Image.open(BytesIO(imgs[0])))
+            STATS["gens"] += 1
             time.sleep(0.3)
         except Exception as e:
-            log(f"    candidate {i+1} failed: {e}")
-    STATS["total_candidates"] += len(candidates)
-    return candidates
+            log(f"    cand {i+1} err: {e}")
+    return cands
 
-def gen_background(save_path, prompt, negative, world):
-    """Generate background: best-of-N, upscale, color grade, sharpen."""
-    path = ASSETS_DIR / save_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    style = WORLD_STYLE.get(world, "")
-    full_prompt = style + prompt
-
-    log(f"    Generating {CANDIDATES} candidates...")
-    candidates = generate_candidates(full_prompt, negative, BG_WIDTH, BG_HEIGHT)
-
-    if not candidates:
-        log(f"  x FAIL {path.name}: no candidates")
-        STATS["fail"] += 1
-        return False
-
-    # Pick best
-    best = pick_best(candidates)
-    log(f"    Picked best of {len(candidates)} (score: {detail_score(best):.1f})")
-
-    # Upscale to game resolution
-    best = upscale_lanczos(best, BG_UPSCALE_WIDTH, BG_UPSCALE_HEIGHT)
-
-    # Color grade for world consistency
+def gen_bg(path, prompt, neg, world):
+    p = ASSETS_DIR / path; p.parent.mkdir(parents=True, exist_ok=True)
+    full = STYLE.get(world, "") + prompt
+    log(f"    {CANDIDATES} candidates...")
+    cands = gen_candidates(full, neg, BG_WIDTH, BG_HEIGHT)
+    if not cands: log(f"  x FAIL {p.name}"); STATS["fail"] += 1; return
+    best = pick_best(cands)
+    best = best.resize((BG_FINAL_W, BG_FINAL_H), Image.LANCZOS)
     best = color_grade(best, world)
+    best = sharpen(best, 1.2)
+    best.save(p, "PNG"); log(f"  OK {p}"); STATS["ok"] += 1
 
-    # Sharpen
-    best = sharpen_pass(best, 1.2)
-
-    best.save(path, "PNG", optimize=True)
-    log(f"  OK {path} ({best.size[0]}x{best.size[1]})")
-    STATS["ok"] += 1
-    return True
-
-def gen_sprite(save_path, prompt, negative, final_size=SPRITE_FINAL_SIZE, bg_color=BG_COLOR_NAVY):
-    """Generate sprite: best-of-N, bg remove, trim, resize, sharpen."""
-    path = ASSETS_DIR / save_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    style = WORLD_STYLE.get("sprite", "")
-    full_prompt = style + prompt
-
-    log(f"    Generating {CANDIDATES} candidates...")
-    candidates = generate_candidates(full_prompt, negative, SPRITE_GEN_SIZE, SPRITE_GEN_SIZE, cfg_val=SPRITE_CFG)
-
-    if not candidates:
-        log(f"  x FAIL {path.name}: no candidates")
-        STATS["fail"] += 1
-        return False
-
-    # Pick best
-    best = pick_best(candidates)
-    log(f"    Picked best of {len(candidates)}")
-
-    # Remove background
-    best = remove_background_smart(best, bg_color)
-
-    # Trim transparent borders
-    best = trim_transparent(best)
-
-    # Resize to final size (maintain aspect ratio)
-    best.thumbnail((final_size, final_size), Image.LANCZOS)
-
-    # Sharpen
-    # Convert to RGB for sharpening, then restore alpha
+def gen_sprite(path, prompt, neg, size=SPRITE_FINAL, bg=BG_NAVY):
+    p = ASSETS_DIR / path; p.parent.mkdir(parents=True, exist_ok=True)
+    full = STYLE.get("sprite", "") + prompt
+    log(f"    {CANDIDATES} candidates...")
+    cands = gen_candidates(full, neg, SPRITE_GEN, SPRITE_GEN, cfg=SPRITE_CFG)
+    if not cands: log(f"  x FAIL {p.name}"); STATS["fail"] += 1; return
+    best = pick_best(cands)
+    best = remove_bg(best, bg)
+    best = trim(best)
+    best.thumbnail((size, size), Image.LANCZOS)
     if best.mode == "RGBA":
-        rgb = best.convert("RGB")
-        rgb = sharpen_pass(rgb, 1.4)
-        r, g, b = rgb.split()
-        a = best.split()[3]
-        best = Image.merge("RGBA", (r, g, b, a))
+        rgb = sharpen(best.convert("RGB"), 1.4)
+        r,g,b = rgb.split(); a = best.split()[3]
+        best = Image.merge("RGBA", (r,g,b,a))
+    best.save(p, "PNG"); log(f"  OK {p} ({best.size[0]}x{best.size[1]})"); STATS["ok"] += 1
 
-    best.save(path, "PNG", optimize=True)
-    log(f"  OK {path} ({best.size[0]}x{best.size[1]})")
-    STATS["ok"] += 1
-    return True
-
-def gen_ui_image(save_path, prompt, negative):
-    """Generate UI image: best-of-N, upscale, sharpen."""
-    path = ASSETS_DIR / save_path
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    log(f"    Generating {CANDIDATES} candidates...")
-    candidates = generate_candidates(prompt, negative, BG_WIDTH, BG_HEIGHT)
-
-    if not candidates:
-        log(f"  x FAIL {path.name}")
-        STATS["fail"] += 1
-        return False
-
-    best = pick_best(candidates)
-    best = upscale_lanczos(best, BG_UPSCALE_WIDTH, BG_UPSCALE_HEIGHT)
-    best = sharpen_pass(best, 1.2)
-    best.save(path, "PNG", optimize=True)
-    log(f"  OK {path}")
-    STATS["ok"] += 1
-    return True
+def gen_ui(path, prompt, neg):
+    p = ASSETS_DIR / path; p.parent.mkdir(parents=True, exist_ok=True)
+    log(f"    {CANDIDATES} candidates...")
+    cands = gen_candidates(prompt, neg, BG_WIDTH, BG_HEIGHT)
+    if not cands: log(f"  x FAIL {p.name}"); STATS["fail"] += 1; return
+    best = pick_best(cands)
+    best = best.resize((BG_FINAL_W, BG_FINAL_H), Image.LANCZOS)
+    best = sharpen(best, 1.2)
+    best.save(p, "PNG"); log(f"  OK {p}"); STATS["ok"] += 1
 
 # ============================================================================
-# ASSET DEFINITIONS - PREMIUM PROMPTS
+# ASSET DEFINITIONS - PARALLAX-CORRECT
 # ============================================================================
 
-N = "cartoon, anime, illustration, painting, sketch, drawing, 3d render, people, person, human"
+# CRITICAL PARALLAX RULES:
+# - FAR (sky): horizontal panoramic, looking at horizon, SIDE VIEW, tileable
+#   No ground. Just sky/clouds/distant mountains. Fully opaque.
+# - MID (scene): side view main scene, the hero background. Ground + scenery.
+#   Fully opaque. This is what the player sees most.
+# - FOREGROUND: NOT a full scene. Individual objects as transparent sprites.
+#   Placed in-engine. Ferns, grass, rocks, etc.
+# ALL LAYERS SHARE THE SAME HORIZONTAL SIDE-VIEW PERSPECTIVE.
 
-# BACKGROUNDS: (path, prompt, negative, world)
+NN = "cartoon, anime, illustration, painting, sketch, drawing, 3d render, people, person, human, looking up, top down, bird eye, aerial, overhead, vertical"
+
 BACKGROUNDS = [
-    # ===== GARDEN (magical night) =====
-    ("backgrounds/garden/garden-sky.png",
-     "night sky over suburban backyard, thousands of stars visible, thin crescent moon, deep blue to dark purple gradient sky, wispy thin clouds, warm amber glow from distant house windows reflecting on atmosphere, long exposure photography, seamless tileable, 8k ultra detailed",
-     f"daytime, sun, bright sky, {N}", "garden"),
-    ("backgrounds/garden/garden-main.png",
-     "lush backyard garden at night, perfect side view for 2D game, dense flowering bushes with roses and hydrangeas, large ancient oak tree with thick twisted branches, winding stone path with moss between stepping stones, weathered wooden fence with climbing ivy, scattered fireflies creating warm bokeh orbs of light, dew glistening on every leaf, rich detailed vegetation, depth layers, 8k ultra detailed",
-     f"daytime, bare, winter, snow, {N}", "garden"),
-    ("backgrounds/garden/garden-shed.png",
-     "charming old wooden garden shed at night, side view, terracotta pots stacked outside, vintage watering can, cobwebs in corners, ivy and wisteria climbing walls, single warm lantern light from dusty window, garden tools leaning against wall, brick path leading to door, 8k ultra detailed",
-     f"daytime, modern, clean, {N}", "garden"),
-    ("backgrounds/garden/garden-pond.png",
-     "small magical garden pond at night, side view, lily pads with tiny white flowers floating, perfectly reflective dark water surface mirroring moon, mossy ancient rocks around edges, tall reeds and cattails, single firefly reflected in water, peaceful serene atmosphere, 8k ultra detailed",
-     f"daytime, ocean, river, large water, {N}", "garden"),
-    ("backgrounds/garden/garden-tree.png",
-     "magnificent base of ancient oak tree at night, side view, massive exposed gnarled roots creating natural caves, bioluminescent mushrooms growing on bark, thick carpet of fallen autumn leaves, dense moss and lichen covering everything, knot hole glowing with firefly light inside, 8k ultra detailed",
-     f"daytime, small tree, sapling, {N}", "garden"),
-    ("backgrounds/garden/garden-fg.png",
-     "extreme close-up tall wild grass blades and wildflowers at night, ground level macro perspective, shallow depth of field, beautiful bokeh of warm firefly orbs in background, crystal dew drops on grass catching moonlight, dandelion seeds floating, clover flowers, 8k ultra detailed macro photography",
-     f"daytime, sharp background, aerial view, {N}", "garden"),
+    # ===== GARDEN =====
+    # Far: night sky at horizon
+    ("backgrounds/garden/garden-far.png",
+     "panoramic night sky at horizon level, side view landscape format, stars scattered across deep blue-purple sky, thin crescent moon on upper right, wispy clouds near horizon, silhouette of distant houses and trees as a thin strip at very bottom, warm amber glow on horizon from distant city lights, horizontal composition, seamless tileable horizontally, 8k",
+     f"looking up, overhead, ground, close-up, daytime, {NN}", "garden"),
+    # Mid: main garden scene
+    ("backgrounds/garden/garden-mid-1.png",
+     "lush backyard garden at night, SIDE VIEW horizontal perspective like a 2D game background, left to right composition, dense flowering bushes roses hydrangeas, large oak tree with twisted branches, winding stone path with stepping stones, weathered wooden fence with climbing ivy, scattered glowing fireflies as warm orbs, dew on leaves, rich vegetation, ground visible at bottom, sky at top, 8k",
+     f"looking up, top down, {NN}", "garden"),
+    ("backgrounds/garden/garden-mid-2.png",
+     "garden shed area at night, SIDE VIEW horizontal perspective like a 2D game level, charming wooden shed with warm window light, terracotta pots stacked outside, old watering can, ivy covered walls, brick path, garden tools leaning on wall, fireflies floating, ground at bottom sky at top, 8k",
+     f"looking up, top down, {NN}", "garden"),
+    ("backgrounds/garden/garden-mid-3.png",
+     "garden pond area at night, SIDE VIEW horizontal perspective like a 2D platformer, small pond with lily pads and reflective surface, mossy rocks around edges, reeds and cattails, stepping stones crossing over water, ancient tree overhanging, fireflies reflecting in water, ground at bottom sky at top, 8k",
+     f"looking up, top down, {NN}", "garden"),
 
-    # ===== NEIGHBORHOOD (autumn dusk) =====
-    ("backgrounds/neighborhood/neighborhood-sky.png",
-     "breathtaking suburban skyline at golden hour dusk, row of charming houses with warm lit windows, silhouette of power lines and utility poles, spectacular orange pink and purple sunset gradient, tree silhouettes against sky, first stars appearing, seamless tileable, 8k ultra detailed",
-     f"noon, night, {N}", "neighborhood"),
-    ("backgrounds/neighborhood/neighborhood-street.png",
-     "quiet suburban street in autumn evening, perfect side view, cracked sidewalk with weeds growing through, charming white picket fence with peeling paint, classic mailbox, vintage parked cars, warm glowing streetlamp casting pool of light, scattered red and gold autumn leaves, wet pavement reflecting lights, 8k ultra detailed",
-     f"summer, snow, busy, crowded, {N}", "neighborhood"),
-    ("backgrounds/neighborhood/neighborhood-alley.png",
-     "atmospheric narrow alley between old suburban houses at dusk, side view, metal garbage bins, rusty bicycle leaning on brick wall, clothesline with sheets above, dim light at end of alley, autumn leaves collected in corners, puddles reflecting sky, 8k ultra detailed",
-     f"modern city, skyscrapers, clean, {N}", "neighborhood"),
-    ("backgrounds/neighborhood/neighborhood-fg.png",
-     "extreme close-up rusty chain link fence with overgrown weeds at dusk, ground level, shallow depth of field, scattered wet autumn leaves on cracked concrete, warm light filtering through fence, macro photography, seamless tileable, 8k ultra detailed",
-     f"clean, new, {N}", "neighborhood"),
+    # ===== NEIGHBORHOOD =====
+    ("backgrounds/neighborhood/neighborhood-far.png",
+     "panoramic suburban sunset sky at horizon level, side view landscape, spectacular orange pink purple sunset gradient, silhouette of distant rooftops and church steeple at thin bottom strip, power line silhouettes crossing sky, first stars appearing in upper purple area, horizontal composition, seamless tileable, 8k",
+     f"looking up, ground, close-up, noon, {NN}", "neighborhood"),
+    ("backgrounds/neighborhood/neighborhood-mid-1.png",
+     "quiet suburban street in autumn evening, SIDE VIEW horizontal perspective like a 2D game level, cracked sidewalk, charming houses in a row with lit windows, white picket fences, mailboxes, vintage parked car, warm streetlamp casting light pool, red gold autumn leaves on ground, wet pavement reflecting, ground at bottom sky at top, 8k",
+     f"looking up, top down, aerial, {NN}", "neighborhood"),
+    ("backgrounds/neighborhood/neighborhood-mid-2.png",
+     "suburban alley between houses at dusk, SIDE VIEW horizontal perspective like 2D game, brick walls, garbage bins, bicycle leaning on wall, clothesline above, puddles on ground reflecting warm sky, autumn leaves, chain link fence section, ground at bottom sky at top, 8k",
+     f"looking up, top down, {NN}", "neighborhood"),
 
-    # ===== PARK (overcast green) =====
-    ("backgrounds/park/park-sky.png",
-     "dramatic overcast sky over parkland, layers of grey clouds with occasional break of warm light, distant treeline silhouette, moody atmospheric volumetric light, birds silhouette, seamless tileable, 8k ultra detailed",
-     f"clear blue sky, night, sunset, {N}", "park"),
-    ("backgrounds/park/park-main.png",
-     "beautiful public park on overcast day, side view, vast open emerald grass field, weathered wooden park bench, winding gravel path, majestic scattered trees with full canopy, serene pond visible in background, distant playground, soft diffused light, rich green tones, 8k ultra detailed",
-     f"night, desert, {N}", "park"),
-    ("backgrounds/park/park-playground.png",
-     "charming playground equipment in park, side view, colorful painted metal slide with patina, wooden swing set, rubber mulch ground, sand pit with toys left behind, overcast soft light, nostalgic feeling, 8k ultra detailed",
-     f"night, indoor, {N}, children", "park"),
-    ("backgrounds/park/park-pond.png",
-     "peaceful park pond with old wooden dock, side view, family of ducks swimming, tall cattails and bulrushes, graceful weeping willow tree branches touching water, perfect reflections, dragonflies, overcast soft light, 8k ultra detailed",
-     f"ocean, rapids, night, {N}", "park"),
-    ("backgrounds/park/park-fg.png",
-     "close-up park ground level, scattered colorful fallen leaves on wet grass, dandelion puffs, tiny mushroom, small rain puddle, ground level macro, overcast diffused light, seamless tileable, 8k ultra detailed",
-     f"night, bright sun, {N}", "park"),
+    # ===== PARK =====
+    ("backgrounds/park/park-far.png",
+     "panoramic overcast sky at horizon level, side view landscape, layers of grey clouds with occasional warm light break, distant tree line silhouette at thin bottom strip, moody atmospheric, birds in distance, horizontal composition, seamless tileable, 8k",
+     f"looking up, ground, close-up, clear blue, night, {NN}", "park"),
+    ("backgrounds/park/park-mid-1.png",
+     "beautiful public park on overcast day, SIDE VIEW horizontal perspective like 2D platformer, vast emerald grass field, wooden park bench, gravel path winding through, majestic scattered trees with full canopy, pond visible in distance, soft diffused overcast light, ground at bottom sky at top, 8k",
+     f"looking up, top down, night, {NN}", "park"),
+    ("backgrounds/park/park-mid-2.png",
+     "park playground area overcast day, SIDE VIEW horizontal like 2D game, colorful slide and swing set, rubber mulch ground, sand pit, trees surrounding, bench nearby, overcast soft light, ground at bottom sky at top, 8k",
+     f"looking up, top down, night, {NN}", "park"),
+    ("backgrounds/park/park-mid-3.png",
+     "park pond with dock overcast day, SIDE VIEW horizontal like 2D game, wooden dock extending into pond, ducks swimming, cattails and weeping willow, lily pads, gravel path along bank, ground at bottom sky at top, 8k",
+     f"looking up, top down, night, {NN}", "park"),
 
-    # ===== STREAM (lush water) =====
-    ("backgrounds/stream/stream-sky.png",
-     "looking up through dense forest canopy, dappled golden sunlight rays breaking through green leaves, scattered blue sky patches, light particles floating in beams, atmospheric depth, seamless tileable, 8k ultra detailed",
-     f"night, overcast, {N}", "stream"),
-    ("backgrounds/stream/stream-main.png",
-     "crystal clear forest stream, side view, rushing water over smooth rocks creating white ripples, large mossy boulders, lush ferns cascading from banks, dappled sunlight creating light patterns on water, small waterfall cascading in background, incredibly detailed water, 8k ultra detailed",
-     f"desert, ocean, city, {N}", "stream"),
-    ("backgrounds/stream/stream-rapids.png",
-     "dramatic white water rapids between large boulders, side view, powerful current spray and mist, narrow rocky channel, overhanging tree branches with hanging moss, dramatic lighting through mist, action and energy, 8k ultra detailed",
-     f"calm, still, ocean, {N}", "stream"),
-    ("backgrounds/stream/stream-fg.png",
-     "extreme close-up riverbank, wet polished pebbles and stones, unfurling fern fronds, crystal water droplets on leaves, bright green moss on rocks, macro ground level, dappled light, seamless tileable, 8k ultra detailed",
-     f"dry, desert, {N}", "stream"),
+    # ===== STREAM =====
+    ("backgrounds/stream/stream-far.png",
+     "panoramic forest canopy skyline at horizon, side view landscape, dense green treetops forming horizon line at bottom third, blue sky with scattered clouds above, golden sunbeams streaming through gaps between trees, atmospheric haze, horizontal composition, seamless tileable, 8k",
+     f"looking up, ground level, close-up, night, {NN}", "stream"),
+    ("backgrounds/stream/stream-mid-1.png",
+     "crystal clear forest stream, SIDE VIEW horizontal like 2D platformer, rushing water over smooth rocks creating white ripples, large mossy boulders on banks, lush ferns cascading down, tall trees on both sides, dappled sunlight on water, small waterfall in background, ground and water at bottom sky through trees at top, 8k",
+     f"looking up, top down, overhead, {NN}", "stream"),
+    ("backgrounds/stream/stream-mid-2.png",
+     "dramatic white water rapids section, SIDE VIEW horizontal like 2D game level, powerful current between large boulders, spray and mist, narrow rocky channel, overhanging mossy branches, dramatic light through mist, ground at bottom, 8k",
+     f"looking up, top down, calm still, {NN}", "stream"),
 
-    # ===== FOREST (dark mysterious) =====
-    ("backgrounds/forest/forest-sky.png",
-     "looking up through ancient dark forest canopy, almost completely blocking sky, thick branches interweaving, occasional thin beam of light cutting through darkness, mysterious fog drifting between trees high above, 8k ultra detailed",
-     f"bright, open, sunny, {N}", "forest"),
-    ("backgrounds/forest/forest-main.png",
-     "deep ancient forest interior, side view, massive towering trees with trunks wider than houses, impenetrable canopy creating deep shadow, single dramatic shaft of golden light cutting through darkness, thick undergrowth of ferns and moss, mysterious fog rolling between trees at ground level, 8k ultra detailed",
-     f"bright, sparse, meadow, {N}", "forest"),
-    ("backgrounds/forest/forest-night.png",
-     "terrifying dark forest at night, side view, pair of glowing yellow owl eyes peering from black tree hollow, thin moonbeams cutting through canopy gaps, a few lonely fireflies, gnarled tree silhouettes, roots like fingers, oppressive darkness, 8k ultra detailed",
-     f"bright, daytime, friendly, {N}", "forest"),
-    ("backgrounds/forest/forest-fg.png",
-     "extreme close-up ancient forest floor, cluster of glowing bioluminescent mushrooms, decomposing leaves, intricate spider web with morning dew drops catching light, thick emerald moss on fallen log, macro ground level, dark atmosphere, seamless tileable, 8k ultra detailed",
-     f"bright, clean, {N}", "forest"),
+    # ===== FOREST =====
+    ("backgrounds/forest/forest-far.png",
+     "panoramic dark forest skyline at horizon, side view landscape, dense dark treetop canopy forming thick horizon across bottom half, very dark moody sky above with thin light breaking through in one spot, mysterious fog layer between trees, horizontal composition, seamless tileable, 8k",
+     f"bright, open sky, looking up, close-up, {NN}", "forest"),
+    ("backgrounds/forest/forest-mid-1.png",
+     "deep ancient forest interior, SIDE VIEW horizontal like 2D platformer, massive towering trees with trunks wider than houses, impenetrable canopy above creating deep shadow, single dramatic shaft of golden light, thick undergrowth ferns and moss, mysterious fog at ground level, ground at bottom dark canopy at top, 8k",
+     f"looking up, top down, bright, meadow, {NN}", "forest"),
+    ("backgrounds/forest/forest-mid-2.png",
+     "dark forest at night, SIDE VIEW horizontal like 2D game, gnarled tree silhouettes, pair of glowing yellow owl eyes in tree hollow, thin moonbeams cutting through, few lonely fireflies, tangled roots, oppressive darkness, ground at bottom dark sky at top, 8k",
+     f"looking up, top down, bright, daytime, {NN}", "forest"),
 
-    # ===== MOUNTAIN (epic harsh) =====
-    ("backgrounds/mountain/mountain-sky.png",
-     "epic mountain sky, massive towering cumulonimbus clouds lit by golden sun behind them, god rays streaming down, vast infinite sky feeling, snow-capped peaks in far distance below clouds, awe-inspiring scale, seamless tileable, 8k ultra detailed",
-     f"flat, indoor, {N}", "mountain"),
-    ("backgrounds/mountain/mountain-main.png",
-     "dramatic mountain terrain side view, jagged granite cliff face with narrow dangerous ledge path, sparse hardy alpine flowers clinging to cracks, patches of snow and ice, dramatic clouds both below and above creating sense of extreme height, wind-bent dwarf trees, vertigo-inducing scale, 8k ultra detailed",
-     f"flat, forest, city, {N}", "mountain"),
-    ("backgrounds/mountain/mountain-storm.png",
-     "terrifying mountain storm, dark apocalyptic clouds, multiple lightning bolts striking nearby peaks simultaneously, horizontal rain, exposed dangerous rocky ridge, no shelter, raw power of nature, dramatic atmosphere, 8k ultra detailed",
-     f"sunny, calm, peaceful, {N}", "mountain"),
-    ("backgrounds/mountain/mountain-fg.png",
-     "extreme close-up mountain rock face, loose gravel and scree, tiny resilient alpine flower blooming from crack in rock, patches of colorful lichen, thin ice crystals, harsh directional light, macro ground level, seamless tileable, 8k ultra detailed",
-     f"lush, tropical, {N}", "mountain"),
+    # ===== MOUNTAIN =====
+    ("backgrounds/mountain/mountain-far.png",
+     "panoramic dramatic mountain sky at horizon, side view landscape, massive clouds lit from behind by sun creating god rays, distant snow-capped peaks as silhouettes at bottom strip, vast epic sky, horizontal composition, seamless tileable, 8k",
+     f"looking up, ground, forest, flat, close-up, {NN}", "mountain"),
+    ("backgrounds/mountain/mountain-mid-1.png",
+     "dramatic mountain terrain, SIDE VIEW horizontal like 2D platformer, jagged granite cliff face with narrow ledge path, sparse alpine flowers in cracks, snow and ice patches, dramatic clouds at same level creating sense of extreme height, wind-bent dwarf trees, ground and rock at bottom sky at top, 8k",
+     f"looking up, top down, forest, flat, {NN}", "mountain"),
+    ("backgrounds/mountain/mountain-mid-2.png",
+     "mountain in terrifying storm, SIDE VIEW horizontal like 2D game, dark apocalyptic clouds, lightning bolt striking nearby peak, horizontal rain, exposed rocky ridge, no shelter, raw power, ground at bottom dark sky at top, 8k",
+     f"looking up, top down, sunny, calm, {NN}", "mountain"),
 
-    # ===== SKY (cosmic transcendent) =====
-    ("backgrounds/sky/sky-space.png",
-     "edge of space, thin glowing blue atmospheric line on curved horizon far below, transition from deep blue to pure black, thousands of crisp stars and visible milky way galaxy band, absolute silence and vastness, ISS perspective, seamless tileable, 8k ultra detailed",
-     f"ground, trees, buildings, airplane, clouds, {N}", "sky"),
-    ("backgrounds/sky/sky-clouds.png",
-     "breathtaking view above cloud layer, side perspective, towering cathedral-like cumulus cloud formations reaching upward like pillars, golden and pink sunset light illuminating cloud edges from below, deep cobalt blue sky above, first stars becoming visible, ethereal otherworldly beauty, 8k ultra detailed",
-     f"ground, buildings, airplane, {N}", "sky"),
-    ("backgrounds/sky/sky-storm.png",
-     "inside massive thunderstorm cloud, side view, violent swirling dark interior lit by branching lightning arcs, deep purple and electric blue tones, curtain of rain visible below, turbulent and terrifying, raw atmospheric power, 8k ultra detailed",
-     f"sunny, calm, clear, ground, {N}", "sky"),
-    ("backgrounds/sky/sky-fg.png",
-     "extreme close-up thin cirrus cloud wisps and ice crystals at high altitude, light refracting through crystals creating prismatic rainbow sparkles, near-black sky behind, otherworldly ethereal beauty, macro photography, seamless tileable, 8k ultra detailed",
-     f"ground, thick clouds, {N}", "sky"),
+    # ===== SKY =====
+    ("backgrounds/sky/sky-far.png",
+     "edge of space panoramic at horizon level, side view landscape, thin glowing blue atmospheric line curving across bottom, transition from deep blue to pure black, thousands of crisp stars, visible milky way band, absolute vastness, horizontal composition, seamless tileable, 8k",
+     f"ground, trees, buildings, airplane, clouds below, {NN}", "sky"),
+    ("backgrounds/sky/sky-mid-1.png",
+     "breathtaking view above cloud layer, SIDE VIEW horizontal like 2D platformer, towering cathedral cumulus cloud formations as platforms and pillars, golden pink sunset light illuminating cloud edges from below, deep cobalt sky above, stars becoming visible, cloud tops as terrain the player traverses, 8k",
+     f"ground, buildings, airplane, looking up, {NN}", "sky"),
+    ("backgrounds/sky/sky-mid-2.png",
+     "inside massive thunderstorm cloud, SIDE VIEW horizontal like 2D game level, violent swirling dark interior lit by branching lightning, deep purple and electric blue, curtain of rain below, turbulent cloud walls as terrain, 8k",
+     f"sunny, clear, ground, looking up, {NN}", "sky"),
 ]
 
-SPRITE_NEG = f"realistic metal airplane, plastic toy, colored paper, real bird, real frog, feathers, green slimy, {N}"
+# FOREGROUND OBJECTS - individual transparent sprites, placed in-engine
+FOREGROUND = [
+    # Garden foreground objects
+    ("sprites/foreground/garden-grass-1.png", "single tuft of tall wild grass at night, side view, several blades with seed heads, dew drops catching moonlight, isolated on solid #0A0A28 dark navy background, botanical photography, 8k"),
+    ("sprites/foreground/garden-grass-2.png", "single tall dandelion plant at night, side view, full seed puff ready to blow, long stem, leaves at base, isolated on solid #0A0A28 dark navy background, macro photography, 8k"),
+    ("sprites/foreground/garden-fern.png", "single fern frond curling upward, side view, detailed green leaves with unfurling tip, isolated on solid #0A0A28 dark navy background, botanical photography, 8k"),
+    ("sprites/foreground/garden-flower-1.png", "single wild rose bush branch, side view, pink flowers and buds, thorny stem, green leaves, isolated on solid #0A0A28 dark navy background, botanical photography, 8k"),
+    ("sprites/foreground/garden-flower-2.png", "single cluster of white daisies, side view, 3 flowers on stems with leaves, isolated on solid #0A0A28 dark navy background, botanical photography, 8k"),
+    # Stream foreground
+    ("sprites/foreground/stream-fern.png", "single large lush fern plant, side view, multiple fronds cascading outward, rich green, water droplets on leaves, isolated on solid #0A0A28 dark navy background, botanical photography, 8k"),
+    ("sprites/foreground/stream-rock.png", "single mossy river boulder, side view, smooth grey stone covered in bright green moss, wet glistening surface, isolated on solid #0A0A28 dark navy background, 8k"),
+    ("sprites/foreground/stream-reeds.png", "cluster of tall river reeds, side view, thin green stems with brown seed heads at top, isolated on solid #0A0A28 dark navy background, botanical photography, 8k"),
+    # Forest foreground
+    ("sprites/foreground/forest-mushroom.png", "cluster of glowing bioluminescent mushrooms, side view, pale caps with blue-green glow, growing from dark mossy log, isolated on solid #0A0A28 dark navy background, 8k"),
+    ("sprites/foreground/forest-root.png", "single thick gnarled tree root emerging from ground, side view, covered in moss, twisting shape, isolated on solid #0A0A28 dark navy background, 8k"),
+    ("sprites/foreground/forest-branch.png", "single hanging tree branch with moss and lichen, side view, drooping with small ferns growing on it, isolated on solid #0A0A28 dark navy background, 8k"),
+    # Mountain foreground
+    ("sprites/foreground/mountain-rock.png", "single jagged alpine rock formation, side view, grey granite with lichen patches, small crack with alpine flower, isolated on solid #0A0A28 dark navy background, 8k"),
+    ("sprites/foreground/mountain-snow.png", "single snow-covered rock ledge, side view, ice crystals on edge, small icicles hanging below, isolated on solid #0A0A28 dark navy background, 8k"),
+    # Sky foreground
+    ("sprites/foreground/sky-cloud-wisp.png", "single thin wispy cirrus cloud tendril, side view, delicate ice crystal structure, slight rainbow refraction, isolated on solid #000000 pure black background, 8k"),
+]
+
+SPRITE_NEG = f"realistic metal airplane, plastic toy, colored paper, real bird, real frog, feathers, green slimy, {NN}"
 
 CHARACTERS = [
-    # PLANE (8 poses)
-    ("sprites/plane/plane-idle.png", "single white paper airplane, hand-folded origami style, visible sharp fold creases, slightly worn authentic paper texture with subtle fiber detail, soft warm amber glow emanating from within through translucent paper, resting on flat surface with nose slightly raised, perfect side profile silhouette, isolated on solid #0A0A28 dark navy background, professional product photography, studio lighting, 8k"),
-    ("sprites/plane/plane-glide.png", "single white paper airplane in graceful flight, origami style, fold creases visible, wings elegantly spread at slight upward angle, subtle motion blur on wing tips suggesting movement, warm inner glow visible through paper, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/plane/plane-dive.png", "single white paper airplane in steep dive, origami style, nose pointing sharply downward, aerodynamic pose, fold creases, sense of speed and gravity, side profile, warm glow, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/plane/plane-slide.png", "single white paper airplane sliding along flat surface, origami style, belly touching ground, slight forward lean suggesting momentum, fold creases, side profile, warm glow, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/plane/plane-jump.png", "single white paper airplane launching upward at 45 degree angle, origami style, dynamic lifting pose full of energy, fold creases, warm glow intensifying, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/plane/plane-wet.png", "single white paper airplane drooping and slightly crumpled from moisture, darker translucent wet spots on paper, wings sagging downward, melancholy posture, fold lines softened by water, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/plane/plane-dry.png", "single white paper airplane in pristine crisp condition, perfectly sharp fold lines, paper glowing bright warm gold from within, confident upward angle, paper looks fresh and strong, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/plane/plane-hit.png", "single white paper airplane with visible damage, small tear on wing edge, crumpled nose, one wing slightly bent, battle-worn but still airborne, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-
-    # BOAT (4 poses)
-    ("sprites/boat/boat-idle.png", "single white paper origami boat, classic traditional paper boat shape, clean fold creases visible, floating on small area of calm water with beautiful reflection, warm amber glow from within, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/boat/boat-moving.png", "single white paper origami boat moving forward through water, slight forward lean, small V-shaped wake trailing behind, water ripples around hull, dynamic pose, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/boat/boat-rocking.png", "single white paper origami boat tilted to one side on choppy water, small splash against hull, dynamic rocking motion captured, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/boat/boat-transform.png", "single piece of white paper caught mid-fold between airplane and boat shape, magical transformation in progress, glowing warm light at every fold point, geometric transitional form, side profile, isolated on solid #0A0A28 dark navy background, 8k"),
-
-    # FROG (3 poses)
-    ("sprites/frog/frog-crouch.png", "single white paper origami frog in classic folded shape, crouching pose coiled ready to spring, visible geometric fold creases, paper texture, warm amber inner glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/frog/frog-jump.png", "single white paper origami frog at peak of jump, legs fully extended below, airborne dynamic pose, fold creases visible on legs and body, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/frog/frog-land.png", "single white paper origami frog landing with legs compressed absorbing impact, slight paper crumple on contact, fold creases, warm glow dimming slightly, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-
-    # CRANE (3 poses)
-    ("sprites/crane/crane-glide.png", "single white paper origami crane in traditional Japanese thousand cranes style, wings fully spread in graceful soaring glide, beautiful geometric fold creases, elegant and majestic, warm amber glow from within, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/crane/crane-flap.png", "single white paper origami crane with wings angled downward in powerful flap stroke, gaining altitude, dynamic movement, fold creases, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
-    ("sprites/crane/crane-perch.png", "single white paper origami crane standing tall on one leg, wings folded neatly at sides, serene elegant resting pose, precise fold creases, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/plane/plane-idle.png", "single white paper airplane, hand-folded origami, visible sharp fold creases, slightly worn paper texture with fiber detail, soft warm amber glow from within through translucent paper, resting on surface nose raised, perfect side profile, isolated on solid #0A0A28 dark navy background, product photography, studio lighting, 8k"),
+    ("sprites/plane/plane-glide.png", "single white paper airplane in graceful flight, origami, fold creases, wings spread slight upward angle, subtle motion blur on tips, warm inner glow through paper, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/plane/plane-dive.png", "single white paper airplane steep dive, origami, nose pointing sharply down, aerodynamic, fold creases, speed feeling, side profile, warm glow, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/plane/plane-slide.png", "single white paper airplane sliding along surface, origami, belly touching ground, forward lean momentum, fold creases, side profile, warm glow, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/plane/plane-jump.png", "single white paper airplane launching upward 45 degrees, origami, dynamic lifting full of energy, fold creases, warm glow intensifying, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/plane/plane-wet.png", "single white paper airplane drooping crumpled from moisture, darker wet spots, wings sagging, melancholy, fold lines softened by water, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/plane/plane-dry.png", "single white paper airplane pristine crisp, perfectly sharp folds, glowing bright warm gold within, confident upward angle, fresh strong paper, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/plane/plane-hit.png", "single white paper airplane with damage, small tear on wing, crumpled nose, one wing bent, battle-worn, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/boat/boat-idle.png", "single white paper origami boat, classic shape, fold creases, floating on calm water with reflection, warm amber glow within, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/boat/boat-moving.png", "single white paper origami boat moving forward through water, forward lean, V-shaped wake behind, ripples around hull, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/boat/boat-rocking.png", "single white paper origami boat tilted on choppy water, splash against hull, rocking motion, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/boat/boat-transform.png", "white paper mid-fold between airplane and boat shape, magical transformation, glowing warm light at every fold point, geometric transitional, side profile, isolated on solid #0A0A28 dark navy background, 8k"),
+    ("sprites/frog/frog-crouch.png", "single white paper origami frog, crouching coiled to spring, geometric fold creases, warm amber glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/frog/frog-jump.png", "single white paper origami frog peak of jump, legs extended below, airborne dynamic, fold creases, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/frog/frog-land.png", "single white paper origami frog landing legs compressed, slight crumple on impact, fold creases, glow dimming, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/crane/crane-glide.png", "single white paper origami crane, traditional Japanese, wings fully spread soaring glide, geometric folds, elegant majestic, warm amber glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/crane/crane-flap.png", "single white paper origami crane wings downward mid-flap gaining altitude, dynamic, fold creases, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
+    ("sprites/crane/crane-perch.png", "single white paper origami crane standing tall one leg, wings folded at sides, serene elegant, fold creases, warm glow, side profile, isolated on solid #0A0A28 dark navy background, studio photography, 8k"),
 ]
 
 ENEMIES = [
-    # Cat (4 poses)
-    ("sprites/enemies/cat-idle.png", "photorealistic domestic tabby cat sitting upright and alert, side profile, ears pointed forward, bright watchful green eyes, detailed fur texture, tail curled around feet, dramatic night lighting, isolated on solid #0A0A28 dark navy background, national geographic wildlife photography, 8k", f"cartoon, cute, kitten, sleeping, {N}"),
-    ("sprites/enemies/cat-crouch.png", "photorealistic domestic tabby cat in low hunting crouch, side profile, every muscle tensed and visible under fur, eyes locked forward with dilated pupils, tail straight and low, ready to explode into pounce, night lighting, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, cute, relaxed, {N}"),
-    ("sprites/enemies/cat-pounce.png", "photorealistic domestic tabby cat mid-pounce frozen in air, side profile, front paws extended with claws out, back legs fully extended from push-off, body stretched long, intense focused expression, dynamic action shot, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, sitting, relaxed, {N}"),
-    ("sprites/enemies/cat-walk.png", "photorealistic domestic tabby cat in slow deliberate stalking walk, side profile, low body position, placing paws carefully, predatory focused gaze, detailed fur in dim light, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, running, playing, {N}"),
-
-    # Crow (2 poses)
-    ("sprites/enemies/crow-fly.png", "photorealistic large black crow in powerful flight, side profile, wings fully spread showing feather detail, glossy iridescent black plumage, sharp dark beak, intelligent eye, dramatic lighting, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, colorful, parrot, {N}"),
-    ("sprites/enemies/crow-dive.png", "photorealistic large black crow in aggressive diving attack, side profile, wings swept back, talons extended forward, beak open, terrifying angle of attack, dramatic lighting, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, perched, gentle, {N}"),
-
-    # Wasp
-    ("sprites/enemies/wasp-fly.png", "photorealistic paper wasp in aggressive flight, side profile, translucent wings with motion blur, prominent stinger extended, vivid yellow and black banding, compound eyes visible, extreme macro photography, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, cute, bee on flower, {N}"),
-
-    # Fish
-    ("sprites/enemies/fish-jump.png", "photorealistic large rainbow trout leaping dramatically from water, side profile, mouth wide open, water droplets spraying in arc around body, iridescent scales catching light, powerful muscular body, frozen action, isolated on solid #0A0A28 dark navy background, nature photography, 8k", f"cartoon, goldfish, small, aquarium, {N}"),
-
-    # Owl (2 poses)
-    ("sprites/enemies/owl-fly.png", "photorealistic great horned owl in silent flight, side profile, enormous wingspan fully extended, each feather individually detailed, massive talons hanging below, piercing bright yellow eyes staring directly, moonlight on feathers, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, cute, baby owl, {N}"),
-    ("sprites/enemies/owl-swoop.png", "photorealistic great horned owl in steep attack dive, side profile, wings pulled back, enormous talons reaching forward, intense predatory yellow eyes, feathers swept by wind, terrifying and beautiful, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, cute, perched, {N}"),
-
-    # Eagle (2 poses)
-    ("sprites/enemies/eagle-fly.png", "photorealistic golden eagle soaring majestically, side profile, massive wingspan at least 2 meters, every feather detailed, golden-brown plumage catching sunlight, fierce curved beak, powerful build, king of the sky, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, bald eagle, small bird, {N}"),
-    ("sprites/enemies/eagle-dive.png", "photorealistic golden eagle in terrifying hunting stoop, side profile, wings completely folded against body, talons extended forward like weapons, incredible speed captured, mountain context, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, gentle, slow, {N}"),
-
-    # Storm Cloud Boss (2 states)
-    ("sprites/enemies/storm-main.png", "massive towering cumulonimbus thundercloud formation, side view, dark grey-purple interior with visible internal turbulence, multiple lightning bolts branching inside illuminating cloud structure, suggestion of angry face formed by vortex patterns, heavy rain curtain falling below, electric purple and deep blue tones, terrifying scale, isolated on solid #000000 black background, 8k", f"cartoon, white fluffy, friendly, cute, {N}"),
-    ("sprites/enemies/storm-rage.png", "extreme rage state thunderstorm cloud boss, violent swirling vortex forming clear angry face shape, lightning bolts for eyes crackling with energy, wind-torn edges, debris and ice swirling around, multiple lightning strikes below, maximum fury, apocalyptic, isolated on solid #000000 black background, 8k", f"cartoon, friendly, cute, calm, {N}"),
+    ("sprites/enemies/cat-idle.png", "photorealistic tabby cat sitting alert, side profile, ears forward, bright green eyes, detailed fur, tail curled, night lighting, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, cute, kitten, sleeping, {NN}"),
+    ("sprites/enemies/cat-crouch.png", "photorealistic tabby cat low hunting crouch, side profile, muscles tensed, dilated pupils, tail low, ready to pounce, night, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, cute, relaxed, {NN}"),
+    ("sprites/enemies/cat-pounce.png", "photorealistic tabby cat mid-pounce in air, side profile, paws extended claws out, body stretched, intense, dynamic action, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, sitting, {NN}"),
+    ("sprites/enemies/cat-walk.png", "photorealistic tabby cat stalking walk, side profile, low body, careful steps, predatory gaze, dim light, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, running, {NN}"),
+    ("sprites/enemies/crow-fly.png", "photorealistic black crow powerful flight, side profile, wings spread, glossy iridescent plumage, sharp beak, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, colorful, {NN}"),
+    ("sprites/enemies/crow-dive.png", "photorealistic black crow aggressive dive attack, side profile, wings swept, talons forward, beak open, terrifying, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, gentle, {NN}"),
+    ("sprites/enemies/wasp-fly.png", "photorealistic paper wasp aggressive flight, side profile, wings motion blur, stinger extended, yellow black bands, macro, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, cute bee, {NN}"),
+    ("sprites/enemies/fish-jump.png", "photorealistic large trout leaping from water, side profile, mouth open, water spray arc, iridescent scales, powerful, frozen action, isolated on solid #0A0A28 dark navy background, nature photography, 8k", f"cartoon, goldfish, small, {NN}"),
+    ("sprites/enemies/owl-fly.png", "photorealistic great horned owl silent flight, side profile, enormous wingspan, feathers detailed, massive talons, piercing yellow eyes, moonlight, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, cute, baby, {NN}"),
+    ("sprites/enemies/owl-swoop.png", "photorealistic great horned owl steep attack dive, side profile, wings pulled back, talons reaching, predatory yellow eyes, feathers windswept, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, cute, {NN}"),
+    ("sprites/enemies/eagle-fly.png", "photorealistic golden eagle soaring, side profile, massive wingspan, golden-brown plumage in sunlight, fierce beak, powerful, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, small bird, {NN}"),
+    ("sprites/enemies/eagle-dive.png", "photorealistic golden eagle hunting stoop, side profile, wings folded, talons extended like weapons, incredible speed, isolated on solid #0A0A28 dark navy background, wildlife photography, 8k", f"cartoon, gentle, {NN}"),
+    ("sprites/enemies/storm-main.png", "massive cumulonimbus thundercloud, side view, dark purple interior with turbulence, lightning branching inside, angry face in vortex patterns, rain curtain below, electric purple blue, terrifying scale, isolated on solid #000000 black background, 8k", f"cartoon, white fluffy, friendly, {NN}"),
+    ("sprites/enemies/storm-rage.png", "rage state thunderstorm cloud boss, violent vortex forming clear angry face, lightning bolt eyes crackling, wind-torn edges, debris swirling, multiple lightning strikes, apocalyptic, isolated on solid #000000 black background, 8k", f"cartoon, friendly, cute, {NN}"),
 ]
 
 OBJECTS = [
-    # Hazards
-    ("sprites/hazards/fire-campfire.png", "photorealistic small campfire, side view, dancing orange and yellow flames with detailed tips, pile of red hot glowing embers, thin smoke wisps rising, crossed wood logs with bark detail, warm light radiating, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, large explosion, {N}"),
-    ("sprites/hazards/fire-candle.png", "photorealistic lit beeswax candle with warm dancing flame, side view, melting wax dripping down sides, gentle warm glow, isolated on solid #0A0A28 dark navy background, product photography, 8k", f"cartoon, {N}"),
-
-    # Garden objects
-    ("sprites/objects/sprinkler.png", "photorealistic garden oscillating sprinkler, side view, metal and green plastic, beautiful arc of water spray with individual droplets catching light, wet grass around base, isolated on solid #0A0A28 dark navy background, product photography, 8k", f"cartoon, industrial, {N}"),
-    ("sprites/objects/fence-picket.png", "photorealistic section of classic white picket fence, side view, charming weathered paint with character, detailed wood grain, slightly crooked post, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, metal, new, {N}"),
-    ("sprites/objects/fence-wood.png", "photorealistic rustic wooden garden fence panel, side view, natural brown aged wood with beautiful grain pattern, horizontal slats with gaps, moss growing at base, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, metal, chain link, {N}"),
-    ("sprites/objects/bush-round.png", "photorealistic perfectly round topiary garden bush, side view, dense vivid green leaves, freshly trimmed spherical shape, isolated on solid #0A0A28 dark navy background, garden photography, 8k", f"cartoon, dead, brown, {N}"),
-    ("sprites/objects/bush-wild.png", "photorealistic wild natural garden bush with small white flowers, side view, organic uneven shape, rich green leaves, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, trimmed, {N}"),
-    ("sprites/objects/flowers.png", "photorealistic beautiful cluster of garden wildflowers, side view, mixed colorful daisies cosmos and black-eyed susans, green stems and leaves, vibrant petals, isolated on solid #0A0A28 dark navy background, botanical photography, 8k", f"cartoon, single, bouquet, {N}"),
-    ("sprites/objects/mushrooms.png", "photorealistic cluster of small forest mushrooms growing from mossy ground, side view, brown caps with white spots, delicate white stems, tiny dewdrops, macro photography, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, giant, psychedelic, {N}"),
-    ("sprites/objects/stone.png", "photorealistic natural garden stepping stone, three quarter view, smooth grey river stone, patches of green moss on edges, organic rounded shape, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, brick, {N}"),
-
-    # Collectible
-    ("sprites/collectibles/firefly.png", "single firefly insect emitting beautiful bright warm yellow-green bioluminescent glow, extreme macro photography, translucent delicate veined wings, small dark body with glowing abdomen, magical halo of light around it, isolated on solid #000000 pure black background, enchanting, 8k", f"cartoon, butterfly, moth, multiple, swarm, {N}"),
+    ("sprites/hazards/fire-campfire.png", "photorealistic small campfire, side view, dancing orange yellow flames with tips, red hot embers, smoke wisps, crossed wood logs with bark, warm light, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, explosion, {NN}"),
+    ("sprites/hazards/fire-candle.png", "photorealistic lit beeswax candle dancing flame, side view, melting wax dripping, warm glow, isolated on solid #0A0A28 dark navy background, product photography, 8k", f"cartoon, {NN}"),
+    ("sprites/objects/sprinkler.png", "photorealistic garden sprinkler, side view, metal green plastic, water spray arc with droplets catching light, isolated on solid #0A0A28 dark navy background, product photography, 8k", f"cartoon, {NN}"),
+    ("sprites/objects/fence-picket.png", "photorealistic white picket fence section, side view, weathered paint, wood grain, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, metal, {NN}"),
+    ("sprites/objects/fence-wood.png", "photorealistic rustic wooden fence panel, side view, aged brown wood, horizontal slats, moss at base, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, metal, {NN}"),
+    ("sprites/objects/bush-round.png", "photorealistic round topiary bush, side view, dense vivid green, freshly trimmed spherical, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, dead, {NN}"),
+    ("sprites/objects/bush-wild.png", "photorealistic wild bush with small white flowers, side view, organic shape, rich green, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, {NN}"),
+    ("sprites/objects/flowers.png", "photorealistic cluster wildflowers, side view, colorful daisies cosmos, green stems, vibrant petals, isolated on solid #0A0A28 dark navy background, botanical photography, 8k", f"cartoon, single, {NN}"),
+    ("sprites/objects/mushrooms.png", "photorealistic cluster small forest mushrooms, side view, brown caps white spots, delicate stems, dewdrops, mossy base, macro, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, giant, {NN}"),
+    ("sprites/objects/stone.png", "photorealistic natural stepping stone, three quarter view, smooth grey river stone, moss patches, organic shape, isolated on solid #0A0A28 dark navy background, 8k", f"cartoon, {NN}"),
+    ("sprites/collectibles/firefly.png", "single firefly insect bright warm yellow-green bioluminescent glow, extreme macro, translucent veined wings, glowing abdomen, magical halo, isolated on solid #000000 pure black background, enchanting, 8k", f"cartoon, butterfly, moth, multiple, {NN}"),
 ]
 
 UI_ASSETS = [
-    ("ui/menu-bg.png",
-     "masterpiece, photorealistic child's wooden study desk photographed from directly above, scattered sheets of white paper with fold marks, colorful pencils and crayons arranged messily, several hand-folded origami paper airplanes and boats in white paper, warm brass desk lamp casting golden pool of light, cozy bedroom atmosphere with wooden texture, nostalgic warm feeling, top-down flat lay photography, 8k ultra detailed",
-     f"cartoon, messy room, dark, {N}, hands, fingers"),
-    ("ui/world-map.png",
-     "masterpiece, beautifully hand-illustrated treasure map on aged yellowed parchment paper, charming dotted trail path winding from garden with tiny house at bottom-left up through hills and trees in middle section to mountains then through clouds to stars at top-right, small watercolor illustrations along the path, compass rose, torn edges, coffee stain, vintage cartography style, warm sepia tones, 8k ultra detailed",
-     f"photograph, digital, modern, clean, {N}"),
+    ("ui/menu-bg.png", "masterpiece, photorealistic childs wooden desk from above, scattered white paper with folds, colorful pencils crayons, hand-folded origami airplanes and boats, warm brass desk lamp golden light, cozy bedroom, nostalgic, top-down flat lay, 8k", f"cartoon, dark, {NN}, hands, fingers"),
+    ("ui/world-map.png", "masterpiece, hand-illustrated treasure map on aged parchment, dotted trail from garden bottom-left through hills trees mountains to stars top-right, small watercolor illustrations, compass rose, torn edges, vintage cartography, warm sepia, 8k", f"photograph, digital, modern, {NN}"),
 ]
 
 # ============================================================================
 # MAIN
 # ============================================================================
 
-def detect_checkpoint():
+def detect_ckpt():
     global CHECKPOINT
-    if CHECKPOINT:
-        return True
-    models_dir = Path(COMFYUI_MODELS_PATH)
-    if not models_dir.exists():
-        log(f"x Models dir not found: {COMFYUI_MODELS_PATH}")
+    if CHECKPOINT: return True
+    d = Path(COMFYUI_MODELS_PATH)
+    if not d.exists():
+        # Try alternate path
+        alt = Path(r"C:\Users\Mati\Downloads\AI\ComfyUI\ComfyUI\models\checkpoints")
+        if alt.exists(): d = alt
+        else: log(f"x Models dir not found: {COMFYUI_MODELS_PATH}"); return False
+    cks = [f for f in d.glob("*.safetensors") if f.stat().st_size > 2_000_000_000]
+    if not cks:
+        log("x No SDXL checkpoint (>2GB)")
+        log("  https://huggingface.co/SG161222/RealVisXL_V4.0/resolve/main/RealVisXL_V4.0.safetensors")
         return False
-    checks = [f for f in models_dir.glob("*.safetensors") if f.stat().st_size > 2_000_000_000]
-    if not checks:
-        log("x No SDXL checkpoint found (>2GB)")
-        log(f"  Download: https://huggingface.co/SG161222/RealVisXL_V4.0/resolve/main/RealVisXL_V4.0.safetensors")
-        log(f"  Place in: {COMFYUI_MODELS_PATH}")
-        return False
-    for pref in ["realvis", "juggernaut", "dreamshar", "sdxl"]:
-        for c in checks:
-            if pref in c.name.lower():
-                CHECKPOINT = c.name
-                log(f"  Model: {CHECKPOINT} ({c.stat().st_size/1024**3:.1f}GB)")
-                return True
-    CHECKPOINT = checks[0].name
-    log(f"  Model: {CHECKPOINT}")
-    return True
+    for p in ["realvis","juggernaut","dreamshar","sdxl"]:
+        for c in cks:
+            if p in c.name.lower(): CHECKPOINT = c.name; log(f"  Model: {CHECKPOINT} ({c.stat().st_size/1024**3:.1f}GB)"); return True
+    CHECKPOINT = cks[0].name; log(f"  Model: {CHECKPOINT}"); return True
 
-def test_connection():
+def test_conn():
     try:
-        resp = urllib.request.urlopen(f"http://{COMFYUI_URL}/system_stats")
-        data = json.loads(resp.read())
-        vram = data.get("devices", [{}])[0].get("vram_total", 0) / 1024**3
-        log(f"  ComfyUI connected | VRAM: {vram:.1f} GB")
-        return True
-    except:
-        log(f"x ComfyUI not running at {COMFYUI_URL}")
-        log("  Start it: cd ComfyUI && python main.py")
-        return False
+        r = urllib.request.urlopen(f"http://{COMFYUI_URL}/system_stats")
+        d = json.loads(r.read()); v = d.get("devices",[{}])[0].get("vram_total",0)/1024**3
+        log(f"  ComfyUI connected | VRAM: {v:.1f} GB"); return True
+    except: log(f"x ComfyUI not running at {COMFYUI_URL}"); return False
 
 def main():
-    global LOG_FILE
-    print()
-    print("=" * 60)
+    global LOG
+    print("\n" + "="*60)
     print("  W I L D F O L D")
-    print("  Premium Art Pipeline")
+    print("  Premium Art Pipeline v2 (Parallax-Correct)")
     print("  Best-of-4 | Upscale | Color Grade | Smart BG Remove")
-    print("=" * 60)
+    print("="*60)
 
     ASSETS_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_FILE = ASSETS_DIR / "generation_log.txt"
-    with open(LOG_FILE, "w") as f:
-        f.write(f"Wildfold Art Generation - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+    LOG = ASSETS_DIR / "generation_log.txt"
+    with open(LOG, "w") as f: f.write(f"Wildfold Art Gen v2 - {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n")
 
-    if not test_connection():
-        sys.exit(1)
-    if not detect_checkpoint():
-        sys.exit(1)
+    if not test_conn(): sys.exit(1)
+    if not detect_ckpt(): sys.exit(1)
 
-    n_assets = len(BACKGROUNDS) + len(CHARACTERS) + len(ENEMIES) + len(OBJECTS) + len(UI_ASSETS)
-    n_total_gens = n_assets * CANDIDATES
-    est_sec = n_total_gens * 22  # ~22s per SDXL image on 3080 Ti
-    est_hrs = est_sec / 3600
+    all_assets = len(BACKGROUNDS) + len(FOREGROUND) + len(CHARACTERS) + len(ENEMIES) + len(OBJECTS) + len(UI_ASSETS)
+    total_gens = all_assets * CANDIDATES
+    est = total_gens * 22 / 3600
 
-    log(f"\n  Quality mode: Best of {CANDIDATES} candidates per asset")
-    log(f"  Total assets: {n_assets}")
-    log(f"    Backgrounds: {len(BACKGROUNDS)} (upscale to {BG_UPSCALE_WIDTH}x{BG_UPSCALE_HEIGHT} + color grade)")
-    log(f"    Characters:  {len(CHARACTERS)} (bg remove + trim + resize to {SPRITE_FINAL_SIZE}px)")
-    log(f"    Enemies:     {len(ENEMIES)} (bg remove + trim + resize to {ENEMY_FINAL_SIZE}px)")
-    log(f"    Objects:     {len(OBJECTS)} (bg remove + trim + resize)")
-    log(f"    UI:          {len(UI_ASSETS)} (upscale)")
-    log(f"  Total generations: {n_total_gens}")
-    log(f"  Estimated time: ~{est_hrs:.1f} hours")
-    log(f"  Output: {ASSETS_DIR.absolute()}")
+    log(f"\n  Quality: Best of {CANDIDATES} per asset")
+    log(f"  Total assets: {all_assets}")
+    log(f"    BG far+mid:  {len(BACKGROUNDS)} (upscale {BG_FINAL_W}x{BG_FINAL_H} + color grade)")
+    log(f"    FG objects:  {len(FOREGROUND)} (transparent sprites for in-engine placement)")
+    log(f"    Characters:  {len(CHARACTERS)} (bg-remove + trim + {SPRITE_FINAL}px)")
+    log(f"    Enemies:     {len(ENEMIES)} (bg-remove + trim + {ENEMY_FINAL}px)")
+    log(f"    Objects:     {len(OBJECTS)} (bg-remove + trim)")
+    log(f"    UI:          {len(UI_ASSETS)}")
+    log(f"  Total gens: {total_gens}")
+    log(f"  Est. time: ~{est:.1f} hours")
 
-    input(f"\n  Press ENTER to start ({n_total_gens} images to generate)...")
+    input(f"\n  Press ENTER to start...")
 
     start = time.time()
     done = 0
 
     try:
-        # BACKGROUNDS
-        log(f"\n{'='*60}")
-        log(f"  PHASE 1/5: BACKGROUNDS ({len(BACKGROUNDS)} assets)")
-        log(f"{'='*60}")
-        for i, (path, prompt, neg, world) in enumerate(BACKGROUNDS):
-            done += 1
-            log(f"\n[{done}/{n_assets}] {path}")
-            gen_background(path, prompt, neg, world)
+        log(f"\n{'='*60}\n  PHASE 1: BACKGROUNDS ({len(BACKGROUNDS)})\n{'='*60}")
+        for path, prompt, neg, world in BACKGROUNDS:
+            done += 1; log(f"\n[{done}/{all_assets}] {path}")
+            gen_bg(path, prompt, neg, world)
 
-        # CHARACTERS
-        log(f"\n{'='*60}")
-        log(f"  PHASE 2/5: CHARACTERS ({len(CHARACTERS)} assets)")
-        log(f"{'='*60}")
-        for i, (path, prompt) in enumerate(CHARACTERS):
-            done += 1
-            log(f"\n[{done}/{n_assets}] {path}")
-            gen_sprite(path, prompt, SPRITE_NEG, SPRITE_FINAL_SIZE)
+        log(f"\n{'='*60}\n  PHASE 2: FOREGROUND OBJECTS ({len(FOREGROUND)})\n{'='*60}")
+        fg_neg = f"realistic, {NN}"
+        for path, prompt in FOREGROUND:
+            done += 1; log(f"\n[{done}/{all_assets}] {path}")
+            gen_sprite(path, prompt, fg_neg, 384)
 
-        # ENEMIES
-        log(f"\n{'='*60}")
-        log(f"  PHASE 3/5: ENEMIES ({len(ENEMIES)} assets)")
-        log(f"{'='*60}")
-        for i, (path, prompt, neg) in enumerate(ENEMIES):
-            done += 1
-            log(f"\n[{done}/{n_assets}] {path}")
-            bg = BG_COLOR_BLACK if "storm" in path else BG_COLOR_NAVY
-            gen_sprite(path, prompt, neg, ENEMY_FINAL_SIZE, bg)
+        log(f"\n{'='*60}\n  PHASE 3: CHARACTERS ({len(CHARACTERS)})\n{'='*60}")
+        for path, prompt in CHARACTERS:
+            done += 1; log(f"\n[{done}/{all_assets}] {path}")
+            gen_sprite(path, prompt, SPRITE_NEG, SPRITE_FINAL)
 
-        # OBJECTS
-        log(f"\n{'='*60}")
-        log(f"  PHASE 4/5: OBJECTS ({len(OBJECTS)} assets)")
-        log(f"{'='*60}")
-        for i, (path, prompt, neg) in enumerate(OBJECTS):
-            done += 1
-            log(f"\n[{done}/{n_assets}] {path}")
-            bg = BG_COLOR_BLACK if "firefly" in path else BG_COLOR_NAVY
-            gen_sprite(path, prompt, neg, OBJECT_FINAL_SIZE, bg)
+        log(f"\n{'='*60}\n  PHASE 4: ENEMIES ({len(ENEMIES)})\n{'='*60}")
+        for path, prompt, neg in ENEMIES:
+            done += 1; log(f"\n[{done}/{all_assets}] {path}")
+            bg = BG_BLACK if "storm" in path else BG_NAVY
+            gen_sprite(path, prompt, neg, ENEMY_FINAL, bg)
 
-        # UI
-        log(f"\n{'='*60}")
-        log(f"  PHASE 5/5: UI ({len(UI_ASSETS)} assets)")
-        log(f"{'='*60}")
-        for i, (path, prompt, neg) in enumerate(UI_ASSETS):
-            done += 1
-            log(f"\n[{done}/{n_assets}] {path}")
-            gen_ui_image(path, prompt, neg)
+        log(f"\n{'='*60}\n  PHASE 5: OBJECTS ({len(OBJECTS)})\n{'='*60}")
+        for path, prompt, neg in OBJECTS:
+            done += 1; log(f"\n[{done}/{all_assets}] {path}")
+            bg = BG_BLACK if "firefly" in path else BG_NAVY
+            gen_sprite(path, prompt, neg, OBJ_FINAL, bg)
+
+        log(f"\n{'='*60}\n  PHASE 6: UI ({len(UI_ASSETS)})\n{'='*60}")
+        for path, prompt, neg in UI_ASSETS:
+            done += 1; log(f"\n[{done}/{all_assets}] {path}")
+            gen_ui(path, prompt, neg)
 
     except KeyboardInterrupt:
-        log("\n\n  Interrupted by user. Partial results saved.")
+        log("\n  Interrupted. Partial results saved.")
     except Exception as e:
-        log(f"\n\n  Error: {e}")
-        import traceback
-        traceback.print_exc()
+        log(f"\n  Error: {e}")
+        import traceback; traceback.print_exc()
 
-    elapsed = time.time() - start
-    n_files = sum(1 for _ in ASSETS_DIR.rglob("*.png"))
-
-    summary = f"""
-{'='*60}
-  GENERATION COMPLETE
-
-  Images saved:    {n_files}
-  Succeeded:       {STATS['ok']}
-  Failed:          {STATS['fail']}
-  Total candidates generated: {STATS['total_candidates']}
-  Time:            {int(elapsed//3600)}h {int((elapsed%3600)//60)}m {int(elapsed%60)}s
-  Output:          {ASSETS_DIR.absolute()}
-  Log:             {LOG_FILE}
-
-  Next steps:
-    git add assets/
-    git commit -m "Add production art assets"
-    git push
-{'='*60}
-"""
-    log(summary)
+    el = time.time() - start
+    nf = sum(1 for _ in ASSETS_DIR.rglob("*.png"))
+    log(f"\n{'='*60}")
+    log(f"  DONE: {nf} images | {STATS['ok']} ok, {STATS['fail']} fail | {STATS['gens']} total gens")
+    log(f"  Time: {int(el//3600)}h {int((el%3600)//60)}m {int(el%60)}s")
+    log(f"  Output: {ASSETS_DIR.absolute()}")
+    log(f"\n  Next: git add assets/ && git commit -m 'Add art' && git push")
+    log(f"{'='*60}")
 
 if __name__ == "__main__":
     main()
