@@ -1,0 +1,16 @@
+{
+  "name": "wildfold",
+  "version": "0.1.0",
+  "description": "Wildfold — A paper plane's journey to the edge of space",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "phaser": "^3.87.0"
+  },
+  "devDependencies": {
+    "vite": "^6.3.5"
+  }
+}
